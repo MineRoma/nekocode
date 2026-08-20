@@ -278,6 +278,8 @@ func (a *App) command(ctx context.Context, input string) (bool, bool, error) {
 			mode = "YOLO"
 		}
 		a.ui.Println("Permission mode: " + mode + "\nAlways blocked: sudo, rm -rf /, --no-preserve-root, mkfs, shutdown, reboot, and fork bombs.")
+	case "/license", "/version":
+		a.ui.Println(licenseText)
 	case "/session":
 		a.ui.Info("Session: " + a.session.ID)
 	case "/sessions":
@@ -842,6 +844,7 @@ const helpText = `Commands
   /addskill            Register a local skill directory
   /addskills [dir]     Reinstall bundled skills for this mode, or add your own from a directory
   /permissions        Show the active permission policy
+  /license            Show copyright and license terms
   /session            Show the current session ID
   /sessions           List sessions for this project
   /bg <task>          Start a detached background agent (up to 25 at once)
@@ -858,3 +861,19 @@ Startup flags
   neko --resume <session-id>   Resume a specific session and replay its history
   neko --continue --yolo       Continue and auto-approve allowed actions
   neko --background-jobs <n>   Cap concurrent background agents (1-25, default 25)`
+
+// licenseText is the Appropriate Legal Notice the GPL asks interactive programs
+// to make available to their users.
+const licenseText = `Neko, a terminal coding agent.
+Copyright (C) 2026 M1neRoma
+
+This program is free software: you can redistribute it and/or modify it under
+the terms of the GNU General Public License as published by the Free Software
+Foundation, either version 3 of the License, or (at your option) any later
+version.
+
+This program is distributed in the hope that it will be useful, but WITHOUT ANY
+WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
+PARTICULAR PURPOSE. See the GNU General Public License for more details.
+
+The full license is in the LICENSE file, or at <https://www.gnu.org/licenses/>.`

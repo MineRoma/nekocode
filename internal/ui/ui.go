@@ -28,7 +28,8 @@ var slashCommands = []string{
 	"/compact", "/autocompact", "/context", "/cost", "/diff", "/undo",
 	"/checkpoint", "/checkpoints", "/restore",
 	"/bg", "/bgs", "/bglog", "/bgstop",
-	"/skills", "/addskill", "/permissions", "/session", "/sessions", "/help", "/exit",
+	"/skills", "/addskill", "/addskills", "/permissions", "/license",
+	"/session", "/sessions", "/help", "/exit",
 }
 
 type Input struct {

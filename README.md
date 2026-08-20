@@ -305,4 +305,8 @@ See `docs/ARCHITECTURE.md` for package boundaries and the implemented agent loop
 
 ## License
 
-MIT
+GNU General Public License v3.0 or later. See [LICENSE](LICENSE).
+
+Neko is free software: you may redistribute and modify it under the terms of the GPL. Distributed modifications must also be released under the GPL, with source available. There is no warranty.
+
+Changed from MIT in 0.4.2.
