@@ -2,13 +2,13 @@
 
 Neko is a Go terminal coding agent with a Claude Code-style interface, Build/Plan modes, reviewable file edits, safe command execution, resumable project sessions, skills, `AGENTS.md`, OpenAI-compatible APIs, and Anthropic.
 
-> Version 0.4.0. Neko now includes a gradient ASCII banner, clarification questions, queued steering messages, file mentions, collapsible tool summaries, command search, and restore checkpoints.
+> Version 0.4.1. Neko now uses a cyan-to-purple ASCII banner and mode-aware accents: blue for Build and orange for Plan.
 
 ![Neko terminal UI preview](docs/ui-preview.png)
 
 ## Core behavior
 
-- **Build / Plan:** press `Tab` at an empty prompt, or use `/build` and `/plan`.
+- **Build / Plan:** press `Tab` at an empty prompt, or use `/build` and `/plan`. Build uses a blue accent; Plan uses orange.
 - **Ask by default:** writes, shell commands, and skill registration offer `Allow once`, `Allow for session`, or `Deny`.
 - **YOLO:** `--yolo` auto-approves allowed actions. Hard-blocked machine-wide destructive commands remain blocked.
 - **Project context:** Neko discovers the Git root, sends a bounded project tree, and loads global/root/nested `AGENTS.md` instructions.
@@ -21,7 +21,7 @@ Neko is a Go terminal coding agent with a Claude Code-style interface, Build/Pla
 - **Claude Code-style UI:** one persistent full-screen session with a compact welcome card, scrollable conversation, persistent status line, `❯` input, slash-command hints, tool activity, thinking state, and boxed permission modals.
 - **Visible user turns:** submitted prompts stay in the conversation as `❯ user message`, alongside assistant and tool output.
 - **Clarification questions:** the model can present exactly three choices plus `Type my own answer…`.
-- **Queued steering:** prompts entered while the agent works remain visible and run as the next user turn.
+- **Queued steering:** prompts entered while the agent works remain visible, run as the next user turn, and appear as a mode-colored queue count.
 - **Searchable input:** `/` searches commands and `@` searches project files; arrows choose and Enter inserts.
 - **Checkpoints:** every user task creates a restore point; `/checkpoint`, `/checkpoints`, and `/restore` manage rollbacks.
 - **Compact tools:** tool results appear as one-line collapsed summaries.

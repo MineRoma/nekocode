@@ -20,6 +20,18 @@ func TestCommandMatches(t *testing.T) {
 	}
 }
 
+func TestStatusUsesCapitalizedMode(t *testing.T) {
+	model := newChatModel("build", false, "test-model", "session", t.TempDir(), make(chan Input, 2), false)
+	status := model.statusView()
+	if !strings.Contains(status, "Build") || strings.Contains(status, "build") {
+		t.Fatalf("unexpected Build status %q", status)
+	}
+	model.mode = "plan"
+	if status = model.statusView(); !strings.Contains(status, "Plan") || strings.Contains(status, "plan") {
+		t.Fatalf("unexpected Plan status %q", status)
+	}
+}
+
 func TestCompactPreview(t *testing.T) {
 	preview := compactPreview(strings.Repeat("x", 20)+"\nsecond\nthird", 2, 10)
 	if !strings.Contains(preview, "xxxxxxxxxx…") || !strings.Contains(preview, "preview truncated") {

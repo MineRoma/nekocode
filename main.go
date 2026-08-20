@@ -11,7 +11,7 @@ import (
 	"github.com/m1neroma/neko/internal/app"
 )
 
-const version = "0.4.0"
+const version = "0.4.1"
 
 func main() {
 	continueLatest := flag.Bool("continue", false, "continue the latest session for this project")

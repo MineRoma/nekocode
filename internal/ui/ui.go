@@ -397,11 +397,13 @@ func newChatModel(mode string, yolo bool, model, session, cwd string, submit cha
 	field.Width = 90
 	field.Focus()
 	view := viewport.New(80, 16)
-	return chatModel{
+	result := chatModel{
 		width: 90, height: 28, mode: mode, yolo: yolo, model: model, session: session,
 		cwd: cwd, color: color, viewport: view, input: field, submit: submit, streamIndex: -1,
 		files: collectProjectFiles(cwd, 2500),
 	}
+	result.applyModeStyles()
+	return result
 }
 
 func (m chatModel) Init() tea.Cmd { return textinput.Blink }
@@ -416,6 +418,7 @@ func (m chatModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		return m, tea.Quit
 	case statusMsg:
 		m.mode, m.yolo, m.model, m.session = msg.mode, msg.yolo, msg.model, msg.session
+		m.applyModeStyles()
 		return m, nil
 	case logMsg:
 		m.logs = append(m.logs, logEntry{kind: msg.kind, text: msg.text})
@@ -452,6 +455,9 @@ func (m chatModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		field.Placeholder = msg.label
 		field.CharLimit = 32 * 1024
 		field.Width = maxInt(30, minInt(90, m.width-8))
+		if m.color {
+			field.PromptStyle = lipgloss.NewStyle().Bold(true).Foreground(m.accentColor())
+		}
 		if msg.secret {
 			field.EchoMode = textinput.EchoPassword
 			field.EchoCharacter = '•'
@@ -600,7 +606,7 @@ func (m chatModel) View() string {
 		style := lipgloss.NewStyle().Foreground(lipgloss.Color("#7D7A75"))
 		if i == m.suggestionCursor {
 			prefix = "❯ "
-			style = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#D97757"))
+			style = lipgloss.NewStyle().Bold(true).Foreground(m.accentColor())
 		}
 		hint.WriteString("\n" + prefix)
 		hint.WriteString(m.paint(style, suggestion))
@@ -618,7 +624,7 @@ func (m chatModel) headerView() string {
 	body := logo + "\n" + m.muted(fallback(m.model, "No model selected")) + "\n" + m.muted(filepath.Clean(m.cwd))
 	style := lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).Padding(0, 1).Width(width)
 	if m.color {
-		style = style.BorderForeground(lipgloss.Color("#D97757"))
+		style = style.BorderForeground(lipgloss.Color("#38BDF8"))
 	}
 	return style.Render(body)
 }
@@ -628,16 +634,26 @@ func (m chatModel) statusView() string {
 	if m.yolo {
 		permission = "YOLO"
 	}
-	value := strings.ToLower(fallback(m.mode, "build")) + " · " + fallback(m.model, "no model") + " · " + permission + " · Tab switches mode"
-	return m.muted(value)
+	mode := "Build"
+	if strings.EqualFold(m.mode, "plan") {
+		mode = "Plan"
+	}
+	accent := lipgloss.NewStyle().Bold(true).Foreground(m.accentColor())
+	parts := []string{
+		m.paint(accent, mode),
+		m.muted(fallback(m.model, "no model")),
+		m.paint(accent, permission),
+	}
+	if queued := len(m.submit); queued > 0 {
+		parts = append(parts, m.paint(accent, fmt.Sprintf("%d queued", queued)))
+	}
+	parts = append(parts, m.muted("Tab switches mode"))
+	return strings.Join(parts, m.muted(" · "))
 }
 
 func (m chatModel) modalView() string {
 	width := maxInt(30, minInt(76, m.width-4))
-	border := lipgloss.Color("#D97757")
-	if m.modal.permission {
-		border = lipgloss.Color("#D19A66")
-	}
+	border := m.accentColor()
 	title := m.paint(lipgloss.NewStyle().Bold(true).Foreground(border), m.modal.title)
 	var body strings.Builder
 	body.WriteString(title)
@@ -688,14 +704,28 @@ func (m chatModel) gradient(value string) string {
 			continue
 		}
 		ratio := float64(index) / float64(maxInt(1, visible-1))
-		red := int(255 + float64(192-255)*ratio)
-		green := int(122 + float64(132-122)*ratio)
-		blue := int(89 + float64(252-89)*ratio)
+		red := int(56 + float64(192-56)*ratio)
+		green := int(189 + float64(132-189)*ratio)
+		blue := int(248 + float64(252-248)*ratio)
 		color := lipgloss.Color(fmt.Sprintf("#%02X%02X%02X", red, green, blue))
 		out.WriteString(lipgloss.NewStyle().Bold(true).Foreground(color).Render(string(r)))
 		index++
 	}
 	return out.String()
+}
+
+func (m chatModel) accentColor() lipgloss.Color {
+	if strings.EqualFold(m.mode, "plan") {
+		return lipgloss.Color("#F59E0B")
+	}
+	return lipgloss.Color("#3B82F6")
+}
+
+func (m *chatModel) applyModeStyles() {
+	if !m.color {
+		return
+	}
+	m.input.PromptStyle = lipgloss.NewStyle().Bold(true).Foreground(m.accentColor())
 }
 
 func (m chatModel) muted(value string) string {
