@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
@@ -23,9 +24,10 @@ import (
 var ErrInterrupted = errors.New("interrupted")
 
 var slashCommands = []string{
-	"/build", "/plan", "/mode", "/model", "/providers", "/addprovider",
+	"/build", "/plan", "/reverse", "/mode", "/model", "/providers", "/addprovider",
 	"/compact", "/autocompact", "/context", "/cost", "/diff", "/undo",
 	"/checkpoint", "/checkpoints", "/restore",
+	"/bg", "/bgs", "/bglog", "/bgstop",
 	"/skills", "/addskill", "/permissions", "/session", "/sessions", "/help", "/exit",
 }
 
@@ -45,9 +47,12 @@ type UI struct {
 	model       string
 	session     string
 	cwd         string
-	program     *tea.Program
-	input       chan Input
-	done        chan error
+	// mu guards program because background agents report progress from their
+	// own goroutines while the main loop starts and stops the Bubble Tea program.
+	mu      sync.Mutex
+	program *tea.Program
+	input   chan Input
+	done    chan error
 }
 
 func New() *UI {
@@ -74,30 +79,117 @@ func (u *UI) Header(mode string, yolo bool, model, session string) {
 		fmt.Fprintln(u.out, filepath.Clean(u.cwd))
 		return
 	}
+	u.mu.Lock()
 	if u.program == nil {
 		chat := newChatModel(mode, yolo, model, session, u.cwd, u.input, u.color)
-		u.program = tea.NewProgram(chat, tea.WithAltScreen(), tea.WithInput(os.Stdin), tea.WithOutput(u.out))
+		program := tea.NewProgram(chat, tea.WithAltScreen(), tea.WithInput(os.Stdin), tea.WithOutput(u.out))
+		u.program = program
+		u.mu.Unlock()
 		go func() {
-			_, err := u.program.Run()
+			_, err := program.Run()
 			u.done <- err
 		}()
 		return
 	}
-	u.program.Send(statusMsg{mode: mode, yolo: yolo, model: model, session: session})
+	u.mu.Unlock()
+	u.send(statusMsg{mode: mode, yolo: yolo, model: model, session: session})
 }
 
 func (u *UI) Close() {
-	if u.program == nil {
+	u.mu.Lock()
+	program := u.program
+	u.mu.Unlock()
+	if program == nil {
 		return
 	}
-	u.program.Send(closeMsg{})
+	program.Send(closeMsg{})
 	<-u.done
+	u.mu.Lock()
 	u.program = nil
+	u.mu.Unlock()
+}
+
+// SetBackground updates the background-agent counter in the status line. It is
+// safe to call from any goroutine, including a finishing background agent.
+func (u *UI) SetBackground(running, limit int) {
+	u.send(backgroundMsg{running: running, limit: limit})
+}
+
+// Replay renders a resumed session's transcript into the conversation so
+// --continue and --resume show the history instead of an empty screen. The
+// system message is skipped, and tool results keep their collapsed one-line form.
+func (u *UI) Replay(messages []core.Message, summary string) {
+	entries := make([]logEntry, 0, len(messages)+2)
+	if summary != "" {
+		entries = append(entries, logEntry{kind: "info", text: "● Compacted memory from earlier in this session:"})
+		entries = append(entries, logEntry{kind: "tool", text: indentLines(compactPreview(summary, 12, 96))})
+	}
+	for _, message := range messages {
+		switch message.Role {
+		case "system":
+			continue
+		case "user":
+			entries = append(entries, logEntry{kind: "user", text: "❯ " + message.Content})
+		case "assistant":
+			if text := strings.TrimSpace(message.Content); text != "" {
+				entries = append(entries, logEntry{kind: "assistant", text: "✦ " + text})
+			}
+			for _, call := range message.ToolCalls {
+				entries = append(entries, logEntry{kind: "tool", text: "● " + toolLabel(call.Name)})
+			}
+		case "tool":
+			entries = append(entries, logEntry{kind: "tool", text: "└─ " + summarizeToolResult(message.Content) + " · output collapsed"})
+		}
+	}
+	if len(entries) == 0 {
+		return
+	}
+	entries = append(entries, logEntry{kind: "info", text: fmt.Sprintf("● Resumed session · %d earlier messages restored", len(messages))})
+	if u.send(replayMsg{entries: entries}) {
+		return
+	}
+	for _, entry := range entries {
+		u.printPlain(entry.text)
+	}
+}
+
+func indentLines(value string) string {
+	lines := strings.Split(value, "\n")
+	for i, line := range lines {
+		lines[i] = "  " + line
+	}
+	return strings.Join(lines, "\n")
+}
+
+// send delivers a message to the Bubble Tea program and reports whether a
+// program was running. The pointer is copied under the lock so concurrent
+// background agents cannot race the main loop's Header and Close calls.
+func (u *UI) send(msg tea.Msg) bool {
+	u.mu.Lock()
+	program := u.program
+	u.mu.Unlock()
+	if program == nil {
+		return false
+	}
+	program.Send(msg)
+	return true
+}
+
+func (u *UI) running() bool {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return u.program != nil
+}
+
+func (u *UI) printPlain(text string) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	fmt.Fprintln(u.out, text)
 }
 
 func (u *UI) ReadInput(mode string) (Input, error) {
 	u.mode = mode
-	if u.program == nil {
+	if !u.running() {
 		fmt.Fprint(u.out, u.plainStatus()+"\n❯ ")
 		line, err := u.in.ReadString('\n')
 		if err != nil && !errors.Is(err, io.EOF) {
@@ -112,7 +204,9 @@ func (u *UI) ReadInput(mode string) (Input, error) {
 		}
 		return result, nil
 	case err := <-u.done:
+		u.mu.Lock()
 		u.program = nil
+		u.mu.Unlock()
 		if err != nil {
 			return Input{}, err
 		}
@@ -127,9 +221,12 @@ func (u *UI) Select(title string, options []string, selected int) (int, error) {
 	if selected < 0 || selected >= len(options) {
 		selected = 0
 	}
-	if u.program != nil {
+	u.mu.Lock()
+	program := u.program
+	u.mu.Unlock()
+	if program != nil {
 		response := make(chan selectResult, 1)
-		u.program.Send(openSelectMsg{title: title, options: options, selected: selected, response: response})
+		program.Send(openSelectMsg{title: title, options: options, selected: selected, response: response})
 		result := <-response
 		if result.cancelled {
 			return -1, ErrInterrupted
@@ -153,8 +250,8 @@ func (u *UI) Select(title string, options []string, selected int) (int, error) {
 		return n - 1, nil
 	}
 	model := standaloneMenu{title: title, options: options, cursor: selected, color: u.color}
-	program := tea.NewProgram(model, tea.WithInput(os.Stdin), tea.WithOutput(u.out))
-	final, err := program.Run()
+	standalone := tea.NewProgram(model, tea.WithInput(os.Stdin), tea.WithOutput(u.out))
+	final, err := standalone.Run()
 	if err != nil {
 		return -1, err
 	}
@@ -174,9 +271,12 @@ func (u *UI) PromptSecret(label string) (string, error) {
 }
 
 func (u *UI) runPrompt(label string, secret bool) (string, error) {
-	if u.program != nil {
+	u.mu.Lock()
+	program := u.program
+	u.mu.Unlock()
+	if program != nil {
 		response := make(chan promptResult, 1)
-		u.program.Send(openPromptMsg{label: label, secret: secret, response: response})
+		program.Send(openPromptMsg{label: label, secret: secret, response: response})
 		result := <-response
 		if result.cancelled {
 			return "", ErrInterrupted
@@ -189,8 +289,8 @@ func (u *UI) runPrompt(label string, secret bool) (string, error) {
 		return strings.TrimSpace(line), err
 	}
 	model := newStandaloneInput(label, secret, u.color)
-	program := tea.NewProgram(model, tea.WithInput(os.Stdin), tea.WithOutput(u.out))
-	final, err := program.Run()
+	standalone := tea.NewProgram(model, tea.WithInput(os.Stdin), tea.WithOutput(u.out))
+	final, err := standalone.Run()
 	if err != nil {
 		return "", err
 	}
@@ -203,9 +303,12 @@ func (u *UI) runPrompt(label string, secret bool) (string, error) {
 
 func (u *UI) Permission(action safety.Action) safety.Decision {
 	options := []string{"Allow once", "Allow for session", "Deny"}
-	if u.program != nil {
+	u.mu.Lock()
+	program := u.program
+	u.mu.Unlock()
+	if program != nil {
 		response := make(chan selectResult, 1)
-		u.program.Send(openSelectMsg{
+		program.Send(openSelectMsg{
 			title: "Permission required", body: action.Description + "\n\n" + compactPreview(action.Preview, 12, 96),
 			options: options, selected: 0, response: response, permission: true,
 		})
@@ -254,19 +357,24 @@ func (u *UI) Ask(question string, options []core.QuestionOption) (string, error)
 }
 
 func (u *UI) Tool(name, detail string) {
+	label := toolLabel(name)
+	if detail != "" {
+		label += "(" + detail + ")"
+	}
+	u.log("tool", "● "+label)
+}
+
+// toolLabel maps a tool name to its short display label.
+func toolLabel(name string) string {
 	labels := map[string]string{
 		"read_file": "Read", "list_files": "Explore", "search": "Search", "git_diff": "Diff",
 		"write_file": "Write", "replace_in_file": "Edit", "run_command": "Bash", "run_tests": "Test",
 		"update_plan": "Plan", "ask_user": "Question", "load_skill": "Skill", "add_skill": "Add skill",
 	}
-	label := labels[name]
-	if label == "" {
-		label = name
+	if label := labels[name]; label != "" {
+		return label
 	}
-	if detail != "" {
-		label += "(" + detail + ")"
-	}
-	u.log("tool", "● "+label)
+	return name
 }
 
 func (u *UI) ToolResult(name, result string, failed bool) {
@@ -278,24 +386,21 @@ func (u *UI) ToolResult(name, result string, failed bool) {
 }
 
 func (u *UI) Thinking() {
-	if u.program != nil {
-		u.program.Send(thinkingMsg(true))
+	if u.send(thinkingMsg(true)) {
 		return
 	}
 	fmt.Fprint(u.out, "✦ Thinking…")
 }
 
 func (u *UI) Stream(text string) {
-	if u.program != nil {
-		u.program.Send(streamMsg(text))
+	if u.send(streamMsg(text)) {
 		return
 	}
 	fmt.Fprint(u.out, text)
 }
 
 func (u *UI) EndStream() {
-	if u.program != nil {
-		u.program.Send(endStreamMsg{})
+	if u.send(endStreamMsg{}) {
 		return
 	}
 	fmt.Fprintln(u.out)
@@ -308,11 +413,10 @@ func (u *UI) Error(err error)     { u.log("error", "× "+err.Error()) }
 func (u *UI) Println(text string) { u.log("plain", text) }
 
 func (u *UI) log(kind, text string) {
-	if u.program != nil {
-		u.program.Send(logMsg{kind: kind, text: text})
+	if u.send(logMsg{kind: kind, text: text}) {
 		return
 	}
-	fmt.Fprintln(u.out, text)
+	u.printPlain(text)
 }
 
 func (u *UI) plainStatus() string {
@@ -320,7 +424,7 @@ func (u *UI) plainStatus() string {
 	if u.yolo {
 		permission = "YOLO"
 	}
-	return strings.ToLower(fallback(u.mode, "build")) + " · " + fallback(u.model, "no model") + " · " + permission
+	return core.ModeLabel(u.mode) + " · " + fallback(u.model, "no model") + " · " + permission
 }
 
 type logEntry struct {
@@ -345,6 +449,8 @@ type chatModel struct {
 	thinking         bool
 	streamIndex      int
 	modal            *modalState
+	bgRunning        int
+	bgLimit          int
 }
 
 type modalState struct {
@@ -364,6 +470,8 @@ type statusMsg struct {
 	yolo                 bool
 }
 type logMsg struct{ kind, text string }
+type backgroundMsg struct{ running, limit int }
+type replayMsg struct{ entries []logEntry }
 type thinkingMsg bool
 type streamMsg string
 type endStreamMsg struct{}
@@ -422,6 +530,18 @@ func (m chatModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case logMsg:
 		m.logs = append(m.logs, logEntry{kind: msg.kind, text: msg.text})
+		m.refreshLogs()
+		return m, nil
+	case backgroundMsg:
+		m.bgRunning, m.bgLimit = msg.running, msg.limit
+		return m, nil
+	case replayMsg:
+		// Restored history goes in ahead of anything already on screen so the
+		// conversation reads chronologically.
+		m.logs = append(append([]logEntry(nil), msg.entries...), m.logs...)
+		if m.streamIndex >= 0 {
+			m.streamIndex += len(msg.entries)
+		}
 		m.refreshLogs()
 		return m, nil
 	case thinkingMsg:
@@ -634,10 +754,7 @@ func (m chatModel) statusView() string {
 	if m.yolo {
 		permission = "YOLO"
 	}
-	mode := "Build"
-	if strings.EqualFold(m.mode, "plan") {
-		mode = "Plan"
-	}
+	mode := core.ModeLabel(m.mode)
 	accent := lipgloss.NewStyle().Bold(true).Foreground(m.accentColor())
 	parts := []string{
 		m.paint(accent, mode),
@@ -646,6 +763,13 @@ func (m chatModel) statusView() string {
 	}
 	if queued := len(m.submit); queued > 0 {
 		parts = append(parts, m.paint(accent, fmt.Sprintf("%d queued", queued)))
+	}
+	if m.bgRunning > 0 {
+		limit := m.bgLimit
+		if limit <= 0 {
+			limit = 25
+		}
+		parts = append(parts, m.paint(accent, fmt.Sprintf("%d/%d bg", m.bgRunning, limit)))
 	}
 	parts = append(parts, m.muted("Tab switches mode"))
 	return strings.Join(parts, m.muted(" · "))
@@ -715,10 +839,14 @@ func (m chatModel) gradient(value string) string {
 }
 
 func (m chatModel) accentColor() lipgloss.Color {
-	if strings.EqualFold(m.mode, "plan") {
+	switch core.NormalizeMode(m.mode) {
+	case core.ModePlan:
 		return lipgloss.Color("#F59E0B")
+	case core.ModeReverse:
+		return lipgloss.Color("#A855F7")
+	default:
+		return lipgloss.Color("#3B82F6")
 	}
-	return lipgloss.Color("#3B82F6")
 }
 
 func (m *chatModel) applyModeStyles() {
@@ -896,20 +1024,61 @@ func collectProjectFiles(root string, limit int) []string {
 	return files
 }
 
+// commandMatches ranks slash commands for the input hint. Exact prefix matches
+// come first, then anchored fuzzy matches: commands that begin with the same
+// letter and contain the remaining characters in order, so "/co" also offers
+// "/checkpoint".
+//
+// A fully typed command is normally not repeated back. The exception is a
+// command that is also the prefix of longer ones, such as "/bg" against
+// "/bgs": there it is listed first so pressing Enter keeps what was typed
+// instead of silently selecting "/bgs".
 func commandMatches(value string, limit int) []string {
 	if !strings.HasPrefix(value, "/") || strings.Contains(value, " ") {
 		return nil
 	}
-	var matches []string
+	query := strings.ToLower(value)
+	exact := false
+	var prefix, fuzzy []string
 	for _, command := range slashCommands {
-		if strings.HasPrefix(command, value) && command != value {
-			matches = append(matches, command)
-			if len(matches) == limit {
-				break
-			}
+		switch {
+		case command == query:
+			exact = true
+		case strings.HasPrefix(command, query):
+			prefix = append(prefix, command)
+		case anchoredSubsequence(command, query):
+			fuzzy = append(fuzzy, command)
 		}
 	}
+	var matches []string
+	if exact && len(prefix) > 0 {
+		matches = append(matches, query)
+	}
+	matches = append(matches, prefix...)
+	matches = append(matches, fuzzy...)
+	if limit > 0 && len(matches) > limit {
+		matches = matches[:limit]
+	}
 	return matches
+}
+
+// anchoredSubsequence reports whether query's characters appear in order inside
+// command, with the first character after the slash matching exactly.
+func anchoredSubsequence(command, query string) bool {
+	if len(query) < 2 || len(command) < 2 || command[1] != query[1] {
+		return false
+	}
+	remaining := query[2:]
+	if remaining == "" {
+		return true
+	}
+	index := 0
+	for i := 2; i < len(command) && index < len(remaining); i++ {
+		if command[i] == remaining[index] {
+			index++
+		}
+	}
+	return index == len(remaining)
 }
 
 func summarizeToolResult(value string) string {
@@ -933,15 +1102,31 @@ func compactPreview(value string, maxLines, maxWidth int) string {
 		return ""
 	}
 	lines := strings.Split(value, "\n")
+	truncated := false
 	if len(lines) > maxLines {
-		lines = append(lines[:maxLines], "… preview truncated …")
+		lines = lines[:maxLines]
+		truncated = true
 	}
 	for i, line := range lines {
-		if len(line) > maxWidth {
-			lines[i] = line[:maxWidth] + "…"
-		}
+		lines[i] = truncateRunes(line, maxWidth)
+	}
+	if truncated {
+		lines = append(lines, "… preview truncated …")
 	}
 	return strings.Join(lines, "\n")
+}
+
+// truncateRunes shortens a line to at most limit runes. Slicing by byte would
+// split multi-byte runes and emit invalid UTF-8 into the terminal.
+func truncateRunes(value string, limit int) string {
+	if limit <= 0 {
+		return value
+	}
+	runes := []rune(value)
+	if len(runes) <= limit {
+		return value
+	}
+	return string(runes[:limit]) + "…"
 }
 
 func isTerminal(file *os.File) bool {

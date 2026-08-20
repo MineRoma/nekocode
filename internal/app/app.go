@@ -6,11 +6,13 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
 
 	"github.com/m1neroma/neko/internal/agent"
+	"github.com/m1neroma/neko/internal/background"
 	"github.com/m1neroma/neko/internal/config"
 	"github.com/m1neroma/neko/internal/core"
 	"github.com/m1neroma/neko/internal/project"
@@ -23,9 +25,10 @@ import (
 )
 
 type Options struct {
-	Continue bool
-	Resume   string
-	YOLO     bool
+	Continue       bool
+	Resume         string
+	YOLO           bool
+	BackgroundJobs int
 }
 
 type App struct {
@@ -37,7 +40,9 @@ type App struct {
 	session     *session.Session
 	policy      *safety.Policy
 	skills      *skills.Store
+	skillRoot   string
 	tools       *tools.Registry
+	background  *background.Manager
 	lastRefresh time.Time
 }
 
@@ -68,13 +73,22 @@ func Run(ctx context.Context, options Options) error {
 	a := &App{
 		options: options, ui: terminal, config: cfg, project: projectContext,
 		manager: manager, session: current, policy: policy, skills: skillStore, tools: registry,
+		skillRoot: bundledSkillRoot(),
 	}
+	a.background = background.New(options.BackgroundJobs, a.newBackgroundAgent, a.onBackgroundEvent)
 	if err := a.ensureProvider(ctx); err != nil {
 		return err
 	}
 	a.refreshStaleModels(ctx, true)
+	// A session resumed in a mode with bundled skills gets them registered too.
+	a.installBundledSkills(a.session.Mode)
 	a.ui.Header(a.session.Mode, options.YOLO, a.config.Get().ActiveModel, a.session.ID)
+	// A resumed session shows its transcript; a fresh one has nothing to replay.
+	if options.Continue || options.Resume != "" {
+		a.ui.Replay(a.session.Messages, a.session.Summary)
+	}
 	defer a.ui.Close()
+	defer a.background.Shutdown(5 * time.Second)
 	for {
 		a.refreshStaleModels(ctx, false)
 		input, err := a.ui.ReadInput(a.session.Mode)
@@ -118,6 +132,17 @@ func Run(ctx context.Context, options Options) error {
 			a.ui.Error(err)
 		}
 	}
+}
+
+// bundledSkillRoot is where Neko unpacks the skills embedded in the binary.
+// It sits in the user data directory, not the project, so switching modes never
+// writes into a repository. An empty result disables bundled skills.
+func bundledSkillRoot() string {
+	dir, err := os.UserConfigDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(dir, "neko", "skills")
 }
 
 func loadSession(manager *session.Manager, root string, options Options) (*session.Session, error) {
@@ -170,9 +195,11 @@ func (a *App) command(ctx context.Context, input string) (bool, bool, error) {
 	case "/help":
 		a.ui.Println(helpText)
 	case "/build":
-		a.setMode("build")
+		a.setMode(core.ModeBuild)
 	case "/plan":
-		a.setMode("plan")
+		a.setMode(core.ModePlan)
+	case "/reverse":
+		a.setMode(core.ModeReverse)
 	case "/mode":
 		a.toggleMode()
 	case "/addprovider", "/addprovide":
@@ -243,6 +270,8 @@ func (a *App) command(ctx context.Context, input string) (bool, bool, error) {
 		a.printSkills()
 	case "/addskill":
 		return true, false, a.addSkill(args)
+	case "/addskills":
+		return true, false, a.addSkillSet(args)
 	case "/permissions":
 		mode := "ASK"
 		if a.options.YOLO {
@@ -253,24 +282,49 @@ func (a *App) command(ctx context.Context, input string) (bool, bool, error) {
 		a.ui.Info("Session: " + a.session.ID)
 	case "/sessions":
 		return true, false, a.printSessions()
+	case "/bg", "/background":
+		return true, false, a.spawnBackground(ctx, commandArgument(input, parts[0]))
+	case "/bgs", "/jobs":
+		a.printBackground()
+	case "/bglog", "/bgoutput":
+		return true, false, a.printBackgroundLog(args)
+	case "/bgstop", "/bgcancel":
+		return true, false, a.cancelBackground(args)
 	default:
 		return true, false, fmt.Errorf("unknown command %s; use /help", command)
 	}
 	return true, false, nil
 }
 
+// toggleMode advances Build → Plan → Reverse → Build, matching the Tab key.
 func (a *App) toggleMode() {
-	if a.session.Mode == "plan" {
-		a.setMode("build")
-	} else {
-		a.setMode("plan")
-	}
+	a.setMode(core.NextMode(a.session.Mode))
 }
 
 func (a *App) setMode(mode string) {
-	a.session.Mode = mode
+	a.session.Mode = core.NormalizeMode(mode)
 	_ = a.manager.Save(a.session)
-	a.ui.Header(mode, a.options.YOLO, a.config.Get().ActiveModel, a.session.ID)
+	a.installBundledSkills(a.session.Mode)
+	a.ui.Header(a.session.Mode, a.options.YOLO, a.config.Get().ActiveModel, a.session.ID)
+}
+
+// installBundledSkills registers the skills shipped for a mode the first time
+// that mode is entered, so Reverse mode works without a manual /addskills.
+// Bundled skills are Neko's own content written to its own data directory, so
+// this does not go through the permission policy — no project file is touched.
+func (a *App) installBundledSkills(mode string) {
+	if a.skillRoot == "" {
+		return
+	}
+	added, err := a.skills.InstallBundled(a.skillRoot, mode)
+	if err != nil {
+		a.ui.Warn("Could not install bundled " + core.ModeLabel(mode) + " skills: " + err.Error())
+		return
+	}
+	if len(added) == 0 {
+		return
+	}
+	a.ui.Success(fmt.Sprintf("Registered %d bundled %s skills · /skills lists them", len(added), core.ModeLabel(mode)))
 }
 
 func (a *App) ensureProvider(ctx context.Context) error {
@@ -473,18 +527,79 @@ func (a *App) addSkill(args []string) error {
 	return nil
 }
 
+// addSkillSet registers every skill directory under one parent. With no
+// argument it reinstalls Neko's bundled skills for the current mode, which is
+// how a user recovers a skill they deleted.
+func (a *App) addSkillSet(args []string) error {
+	dir := strings.Join(args, " ")
+	if strings.TrimSpace(dir) == "" {
+		added, err := a.skills.InstallBundled(a.skillRoot, a.session.Mode)
+		if err != nil {
+			return err
+		}
+		label := core.ModeLabel(a.session.Mode)
+		if len(added) == 0 {
+			a.ui.Info("Bundled " + label + " skills are already registered. Pass a directory to add your own.")
+			return nil
+		}
+		a.ui.Success(fmt.Sprintf("Registered %d bundled %s skills", len(added), label))
+		return nil
+	}
+	if !filepath.IsAbs(dir) {
+		dir = filepath.Join(a.project.Root, dir)
+	}
+	found, err := skills.Discover(dir)
+	if err != nil {
+		return err
+	}
+	names := make([]string, 0, len(found))
+	for _, descriptor := range found {
+		names = append(names, descriptor.Name)
+	}
+	preview := dir + "\n\n" + strings.Join(names, "\n")
+	if err := a.policy.Authorize(safety.Action{
+		Kind: "skill", Resource: dir,
+		Description: fmt.Sprintf("Register %d skills from %s", len(found), dir),
+		Preview:     preview,
+	}); err != nil {
+		return err
+	}
+	registered := 0
+	for _, descriptor := range found {
+		if err := a.skills.Add(descriptor.Name, descriptor.Path); err != nil {
+			a.ui.Warn("Skipped " + descriptor.Name + ": " + err.Error())
+			continue
+		}
+		registered++
+	}
+	a.ui.Success(fmt.Sprintf("Registered %d of %d skills from %s", registered, len(found), dir))
+	return nil
+}
+
 func (a *App) printSkills() {
 	items := a.skills.List()
 	if len(items) == 0 {
-		a.ui.Println("No skills configured. Use /addskill.")
+		a.ui.Println("No skills configured. Use /addskill or /addskills.")
 		return
 	}
+	current := core.NormalizeMode(a.session.Mode)
 	for _, skill := range items {
 		status := "disabled"
 		if skill.Enabled {
 			status = "enabled"
 		}
-		a.ui.Println(fmt.Sprintf("- %s  %s  (%s)", skill.Name, skill.Path, status))
+		scope := "all modes"
+		if skill.Mode != "" {
+			scope = core.ModeLabel(skill.Mode) + " mode"
+			if core.NormalizeMode(skill.Mode) != current {
+				scope += ", inactive now"
+			}
+		}
+		line := fmt.Sprintf("- %s  (%s · %s)", skill.Name, status, scope)
+		if skill.Summary != "" {
+			line += "\n    " + skill.Summary
+		}
+		a.ui.Println(line)
 	}
 }
 
@@ -496,6 +611,134 @@ func (a *App) printSessions() error {
 	for _, item := range items {
 		a.ui.Println(fmt.Sprintf("- %s  %s  %s", item.ID, item.Mode, item.UpdatedAt.Format(time.RFC3339)))
 	}
+	return nil
+}
+
+// commandArgument returns everything after the command word, preserving the
+// original spacing and case of the task description.
+func commandArgument(input, command string) string {
+	return strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(input), command))
+}
+
+// newBackgroundAgent builds an isolated agent for one background task. Each task
+// gets its own session, its own tool registry, and a non-interactive policy so a
+// detached agent can never block waiting for terminal input.
+func (a *App) newBackgroundAgent(id string, out *background.Writer) (background.Job, error) {
+	cfg := a.config.Get()
+	providerConfig, ok := cfg.ActiveProviderConfig()
+	if !ok {
+		return background.Job{}, errors.New("no active provider; use /addprovider")
+	}
+	if cfg.ActiveModel == "" {
+		return background.Job{}, errors.New("no active model; use /model")
+	}
+	client, err := provider.New(providerConfig)
+	if err != nil {
+		return background.Job{}, err
+	}
+	child, err := a.manager.New(a.project.Root)
+	if err != nil {
+		return background.Job{}, err
+	}
+	child.Mode = a.session.Mode
+	if err := a.manager.Save(child); err != nil {
+		return background.Job{}, err
+	}
+	// Background agents inherit YOLO but never prompt: a nil prompt makes the
+	// policy deny anything that would have required an interactive answer.
+	policy := safety.New(a.options.YOLO, nil)
+	registry := tools.New(a.project.Root, policy, child, a.manager.Save, a.skills, out)
+	codingAgent := agent.New(client, a.config, a.project, child, a.manager.Save, registry, out)
+	codingAgent.SetNotes("You are running as detached background agent " + id + ". Nobody can answer questions or grant permissions, so never call ask_user. " +
+		"Finish autonomously and end with a short report of what you changed and what remains. " +
+		"In Ask mode every write and command is denied, so report what you would change instead of retrying denied tools.")
+	return background.Job{Runner: codingAgent, Session: child.ID, Mode: child.Mode}, nil
+}
+
+func (a *App) onBackgroundEvent(event background.Event) {
+	switch event.Status {
+	case background.StatusDone:
+		a.ui.Success(fmt.Sprintf("Background %s finished: %s · /bglog %s", event.ID, event.Label, event.ID))
+	case background.StatusFailed:
+		a.ui.Warn(fmt.Sprintf("Background %s failed: %s · %s", event.ID, event.Label, event.Err))
+	case background.StatusCancelled:
+		a.ui.Info(fmt.Sprintf("Background %s cancelled: %s", event.ID, event.Label))
+	}
+	a.ui.SetBackground(a.background.Running(), a.background.Limit())
+}
+
+func (a *App) spawnBackground(ctx context.Context, prompt string) error {
+	if strings.TrimSpace(prompt) == "" {
+		return errors.New("usage: /bg <task description>")
+	}
+	snapshot, err := a.background.Spawn(ctx, prompt)
+	if err != nil {
+		return err
+	}
+	a.ui.SetBackground(a.background.Running(), a.background.Limit())
+	a.ui.Success(fmt.Sprintf("Background %s started (%d/%d): %s", snapshot.ID, a.background.Running(), a.background.Limit(), snapshot.Label))
+	a.ui.Info("Session " + snapshot.Session + " · /bgs lists agents · /bglog " + snapshot.ID + " shows output")
+	return nil
+}
+
+func (a *App) printBackground() {
+	items := a.background.List()
+	if len(items) == 0 {
+		a.ui.Println(fmt.Sprintf("No background agents. Use /bg <task> to start one (limit %d).", a.background.Limit()))
+		return
+	}
+	a.ui.Println(fmt.Sprintf("Background agents: %d running of %d allowed", a.background.Running(), a.background.Limit()))
+	for _, item := range items {
+		line := fmt.Sprintf("- %s  %-9s  %5s  %s", item.ID, item.Status, item.Duration().Truncate(time.Second), item.Label)
+		if item.Err != "" {
+			line += "  · " + background.Label(item.Err)
+		}
+		a.ui.Println(line)
+	}
+}
+
+func (a *App) printBackgroundLog(args []string) error {
+	if len(args) == 0 {
+		return errors.New("usage: /bglog <agent-id>")
+	}
+	snapshot, err := a.background.Get(args[0])
+	if err != nil {
+		return err
+	}
+	lines, err := a.background.Output(args[0])
+	if err != nil {
+		return err
+	}
+	a.ui.Println(fmt.Sprintf("%s · %s · %s · session %s", snapshot.ID, snapshot.Status, snapshot.Duration().Truncate(time.Second), snapshot.Session))
+	a.ui.Println("Task: " + snapshot.Prompt)
+	if snapshot.Err != "" {
+		a.ui.Warn(snapshot.Err)
+	}
+	if len(lines) == 0 {
+		a.ui.Println("No output captured yet.")
+		return nil
+	}
+	for _, line := range lines {
+		a.ui.Println("  " + line)
+	}
+	return nil
+}
+
+func (a *App) cancelBackground(args []string) error {
+	if len(args) == 0 {
+		return errors.New("usage: /bgstop <agent-id|all>")
+	}
+	if strings.EqualFold(args[0], "all") {
+		stopped := a.background.CancelAll()
+		a.ui.SetBackground(a.background.Running(), a.background.Limit())
+		a.ui.Success(fmt.Sprintf("Cancellation requested for %d agent(s).", stopped))
+		return nil
+	}
+	snapshot, err := a.background.Cancel(args[0])
+	if err != nil {
+		return err
+	}
+	a.ui.Success("Cancellation requested for " + snapshot.ID + ": " + snapshot.Label)
 	return nil
 }
 
@@ -581,7 +824,8 @@ func (a *App) refreshProviderModels(ctx context.Context, name string) error {
 const helpText = `Commands
   /build              Switch to Build mode
   /plan               Switch to Plan mode
-  /mode               Toggle Build/Plan
+  /reverse            Switch to Reverse mode (analyze binaries and obfuscated code)
+  /mode               Cycle Build → Plan → Reverse
   /addprovider        Add or replace an OpenAI-compatible or Anthropic provider
   /providers          Select a provider
   /model              Select an imported model
@@ -594,17 +838,23 @@ const helpText = `Commands
   /checkpoint [name]  Create a manual restore point
   /restore            Roll back files and conversation to the latest checkpoint
   /checkpoints        List available restore points
-  /skills             List configured skills
+  /skills             List configured skills and which mode each applies to
   /addskill            Register a local skill directory
+  /addskills [dir]     Reinstall bundled skills for this mode, or add your own from a directory
   /permissions        Show the active permission policy
   /session            Show the current session ID
   /sessions           List sessions for this project
+  /bg <task>          Start a detached background agent (up to 25 at once)
+  /bgs                List background agents and their status
+  /bglog <id>         Show the captured output of one background agent
+  /bgstop <id|all>    Cancel one background agent or every running one
   /exit                Exit Neko
 
 Keyboard
-  Tab                  Switch Build/Plan mode
+  Tab                  Cycle Build → Plan → Reverse
 
 Startup flags
-  neko --continue              Continue the latest session in this project
-  neko --resume <session-id>   Resume a specific session in this project
-  neko --continue --yolo       Continue and auto-approve allowed actions`
+  neko --continue              Continue the latest session and replay its history
+  neko --resume <session-id>   Resume a specific session and replay its history
+  neko --continue --yolo       Continue and auto-approve allowed actions
+  neko --background-jobs <n>   Cap concurrent background agents (1-25, default 25)`

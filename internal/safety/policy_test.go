@@ -52,3 +52,20 @@ func TestAllowForSession(t *testing.T) {
 		t.Fatalf("expected one prompt, got %d", prompts)
 	}
 }
+
+// Background agents are built with a nil prompt. Ask mode must deny instead of
+// blocking, because a detached agent has nobody to answer it.
+func TestNilPromptDeniesWithoutBlocking(t *testing.T) {
+	policy := New(false, nil)
+	err := policy.Authorize(Action{Kind: "write", Resource: "main.go"})
+	if err == nil {
+		t.Fatal("expected a non-interactive policy to deny writes")
+	}
+	if got := err.Error(); got != "permission denied: no interactive prompt available" {
+		t.Fatalf("unexpected error %q", got)
+	}
+	// The same policy in YOLO mode proceeds without a prompt.
+	if err := New(true, nil).Authorize(Action{Kind: "write", Resource: "main.go"}); err != nil {
+		t.Fatalf("unexpected denial in YOLO mode: %v", err)
+	}
+}

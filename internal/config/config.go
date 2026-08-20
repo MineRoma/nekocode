@@ -31,6 +31,9 @@ type Skill struct {
 	Name    string `json:"name"`
 	Path    string `json:"path"`
 	Enabled bool   `json:"enabled"`
+	// Mode restricts a skill to one session mode. Empty means every mode.
+	Mode    string `json:"mode,omitempty"`
+	Summary string `json:"summary,omitempty"`
 }
 
 type Config struct {

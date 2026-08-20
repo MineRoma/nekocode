@@ -29,10 +29,17 @@ type Agent struct {
 	save    func(*session.Session) error
 	tools   *tools.Registry
 	ui      UI
+	notes   string
 }
 
 func New(client provider.Client, cfg *config.Store, projectContext project.Context, current *session.Session, save func(*session.Session) error, registry *tools.Registry, ui UI) *Agent {
 	return &Agent{client: client, config: cfg, project: projectContext, session: current, save: save, tools: registry, ui: ui}
+}
+
+// SetNotes appends extra operating instructions to the system prompt. Background
+// agents use it to explain that they are detached and cannot prompt the user.
+func (a *Agent) SetNotes(notes string) {
+	a.notes = strings.TrimSpace(notes)
 }
 
 func (a *Agent) Run(ctx context.Context, userText string) error {
@@ -137,9 +144,17 @@ func (a *Agent) updateSystemMessage() {
 }
 
 func (a *Agent) systemPrompt() string {
-	modeRules := "You are in BUILD mode. You may inspect the project, edit files, run commands, and verify the result. Use tools instead of merely describing actions. Keep the plan current for multi-step work."
-	if a.session.Mode == "plan" {
+	var modeRules string
+	switch core.NormalizeMode(a.session.Mode) {
+	case core.ModePlan:
 		modeRules = "You are in PLAN mode. Inspect and reason only. Do not edit files or run commands. Produce an actionable implementation plan and use update_plan to keep it visible."
+	case core.ModeReverse:
+		modeRules = "You are in REVERSE mode. Your task is to understand artifacts you did not write: binaries, bytecode, minified or obfuscated code, packed executables, and undocumented protocols. " +
+			"Recover structure, behavior, and intent, then write your findings down as readable notes, annotated pseudocode, or a reimplementation. " +
+			"Work outside-in: identify the format and toolchain first, map entry points and strings second, and only then dive into individual functions. " +
+			"State confidence explicitly and separate what you verified from what you inferred."
+	default:
+		modeRules = "You are in BUILD mode. You may inspect the project, edit files, run commands, and verify the result. Use tools instead of merely describing actions. Keep the plan current for multi-step work."
 	}
 	var b strings.Builder
 	b.WriteString("You are Neko, a terminal coding agent. Work methodically and communicate concisely.\n\n")
@@ -153,6 +168,19 @@ func (a *Agent) systemPrompt() string {
 	b.WriteString("- If a material ambiguity changes the implementation, call ask_user with two or three useful choices instead of guessing. Do not ask trivial questions.\n")
 	b.WriteString("- Neko creates a checkpoint before each user task. If your changes are wrong or the user wants to revert the turn, recommend /restore.\n")
 	b.WriteString("\nProject root: " + a.project.Root + "\n")
+	if skills := a.tools.SkillsForMode(a.session.Mode); len(skills) > 0 {
+		b.WriteString("\nSkills available in this mode (load with load_skill before relying on one):\n")
+		for _, skill := range skills {
+			line := "- " + skill.Name
+			if skill.Summary != "" {
+				line += ": " + skill.Summary
+			}
+			b.WriteString(line + "\n")
+		}
+	}
+	if a.notes != "" {
+		b.WriteString("\nExecution context:\n" + a.notes + "\n")
+	}
 	if a.project.Instructions != "" {
 		b.WriteString("\nProject instructions from AGENTS.md:\n" + a.project.Instructions + "\n")
 	}

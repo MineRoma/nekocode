@@ -69,7 +69,7 @@ func (m *Manager) New(projectRoot string) (*Session, error) {
 		return nil, err
 	}
 	now := time.Now()
-	s := &Session{ID: id, ProjectRoot: projectRoot, CreatedAt: now, UpdatedAt: now, Mode: "build"}
+	s := &Session{ID: id, ProjectRoot: projectRoot, CreatedAt: now, UpdatedAt: now, Mode: core.ModeBuild}
 	return s, m.Save(s)
 }
 
@@ -99,6 +99,8 @@ func (m *Manager) Load(id string) (*Session, error) {
 	if err := json.Unmarshal(data, &s); err != nil {
 		return nil, err
 	}
+	// Sessions written by older versions may hold an unknown or empty mode.
+	s.Mode = core.NormalizeMode(s.Mode)
 	return &s, nil
 }
 

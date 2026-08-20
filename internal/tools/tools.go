@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/m1neroma/neko/internal/config"
 	"github.com/m1neroma/neko/internal/core"
 	ndiff "github.com/m1neroma/neko/internal/diff"
 	"github.com/m1neroma/neko/internal/project"
@@ -38,6 +39,14 @@ func New(root string, policy *safety.Policy, current *session.Session, save func
 	return &Registry{root: root, policy: policy, session: current, save: save, skills: skillStore, reporter: reporter}
 }
 
+// SkillsForMode lists the enabled skills usable in the given mode.
+func (r *Registry) SkillsForMode(mode string) []config.Skill {
+	if r.skills == nil {
+		return nil
+	}
+	return r.skills.ForMode(mode)
+}
+
 func (r *Registry) Definitions(mode string) []core.ToolDefinition {
 	all := []core.ToolDefinition{
 		{Name: "read_file", Description: "Read a UTF-8 text file inside the project with line numbers.", ReadOnly: true, InputSchema: object(map[string]any{"path": stringProp("Project-relative file path"), "offset": integerProp("First line, starting at 1"), "limit": integerProp("Maximum lines")}, "path")},
@@ -53,7 +62,8 @@ func (r *Registry) Definitions(mode string) []core.ToolDefinition {
 		{Name: "load_skill", Description: "Load the instructions from a configured skill.", ReadOnly: true, InputSchema: object(map[string]any{"name": stringProp("Configured skill name")}, "name")},
 		{Name: "add_skill", Description: "Register a local skill directory containing SKILL.md. Requires permission in Ask mode.", InputSchema: object(map[string]any{"name": stringProp("Skill name"), "path": stringProp("Local skill directory")}, "name", "path")},
 	}
-	if mode != "plan" {
+	// Build and Reverse expose every tool; only Plan is restricted to read-only.
+	if core.NormalizeMode(mode) != core.ModePlan {
 		return all
 	}
 	var readonly []core.ToolDefinition
